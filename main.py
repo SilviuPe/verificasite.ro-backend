@@ -14,9 +14,17 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Site Analyzer", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:4173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class AnalyzeRequest(BaseModel):
     url: str = Field(..., description="URL in orice forma: domain, www.domain, http(s)://...")
@@ -375,7 +383,6 @@ async def _www_resolve_report(final_url: str) -> Dict[str, Any]:
 def _detect_tech(html: str) -> Dict[str, Any]:
     s = (html or "").lower()
 
-    # Heuristici simple. Nu sunt perfecte.
     ga = ("www.googletagmanager.com/gtag/js" in s) or ("google-analytics.com" in s) or ("gtag(" in s)
     gtm = ("googletagmanager.com/gtm.js" in s) or ("gtm-" in s)
     jquery = ("jquery" in s)
@@ -416,6 +423,100 @@ async def _custom_404_check(final_url: str) -> Dict[str, Any]:
             return {"probe_url": probe, "error": str(e)}
 
 
+def _extract_wp_version_from_text(text: str) -> Optional[str]:
+    """
+    Extrage o versiune WordPress dintr-un text de tip generator.
+    Accepta doar formate clasice: 'WordPress 6.5.3'
+    """
+    if not text:
+        return None
+    m = re.search(r"\bWordPress\s+(\d+(?:\.\d+){1,3})\b", text, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _detect_wordpress_from_html(html: str, headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Detectie WordPress bazata pe semnale verificabile din HTML si headers.
+    Nu ghicim. Daca versiunea nu este expusa, returnam null si motiv.
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+    html_lower = (html or "").lower()
+
+    signals: List[str] = []
+    version: Optional[str] = None
+
+    # 1) Meta generator
+    gen = soup.find("meta", attrs={"name": re.compile(r"^generator$", re.I)})
+    if gen and gen.get("content"):
+        gen_content = str(gen.get("content")).strip()
+        if "wordpress" in gen_content.lower():
+            signals.append("meta_generator")
+            v = _extract_wp_version_from_text(gen_content)
+            if v:
+                version = v
+
+    # 2) Prezenta de path-uri specifice
+    if "/wp-content/" in html_lower:
+        signals.append("wp_content_path")
+    if "/wp-includes/" in html_lower:
+        signals.append("wp_includes_path")
+
+    # 3) Headers (rare)
+    x_powered = (headers.get("x-powered-by") or "").lower()
+    if "wordpress" in x_powered:
+        signals.append("x_powered_by")
+
+    link_hdr = (headers.get("link") or "").lower()
+    # uneori apare rel="https://api.w.org/"
+    if "api.w.org" in link_hdr:
+        signals.append("header_api_w_org")
+
+    is_wordpress = len(signals) > 0
+
+    reason: Optional[str] = None
+    if is_wordpress and not version:
+        reason = "WordPress detected, but version is not exposed via meta generator or other public hints."
+
+    return {
+        "is_wordpress": is_wordpress,
+        "version": version,          # poate fi None
+        "signals": signals,          # ca sa vezi pe ce s-a bazat
+        "version_reason": reason,    # explicatie cand e None
+    }
+
+async def _try_wp_version_from_feed(final_url: str) -> Optional[str]:
+    """
+    Incearca /feed/ sau /?feed=rss2 si cauta generator.
+    Returneaza versiune doar daca gaseste explicit 'WordPress x.y.z'.
+    """
+    candidates = [
+        urljoin(final_url, "/feed/"),
+        urljoin(final_url, "/?feed=rss2"),
+    ]
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(12.0),
+        headers={"User-Agent": "Mozilla/5.0 (compatible; SiteAnalyzer/1.0; +https://example.local)"},
+    ) as client:
+        for u in candidates:
+            try:
+                r = await client.get(u)
+                if r.status_code >= 400:
+                    continue
+                txt = r.text or ""
+                # cauta <generator>https://wordpress.org/?v=6.5.3</generator>
+                m = re.search(r"wordpress\.org/\?v=(\d+(?:\.\d+){1,3})", txt, re.IGNORECASE)
+                if m:
+                    return m.group(1)
+                # sau generator "WordPress 6.5.3"
+                v = _extract_wp_version_from_text(txt)
+                if v:
+                    return v
+            except Exception:
+                continue
+    return None
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
     candidates = _build_url_candidates(req.url)
@@ -426,13 +527,22 @@ async def analyze(req: AnalyzeRequest):
     host = _hostname_from_url(fetched.final_url)
     ip = _resolve_ip(host)
 
-    # SSL ok: daca final_url e https si fetch a reusit cu TLS verify (httpx default)
     ssl_ok = urlparse(fetched.final_url).scheme == "https"
 
     html_analysis = _analyze_html(fetched.final_url, fetched.html)
+
+    wp = _detect_wordpress_from_html(fetched.html, fetched.headers)
+
+    # optional: daca e wordpress dar versiunea lipseste, incearca feed
+    if wp["is_wordpress"] and not wp["version"]:
+        feed_v = await _try_wp_version_from_feed(fetched.final_url)
+        if feed_v:
+            wp["version"] = feed_v
+            wp["signals"].append("rss_generator")
+            wp["version_reason"] = None
+
     links_sample = html_analysis["links"]["extracted_sample"]
 
-    # checks async in paralel
     links_task = asyncio.create_task(_check_links(links_sample, limit=60))
 
     robots_url = urljoin(fetched.final_url, "/robots.txt")
@@ -449,7 +559,6 @@ async def analyze(req: AnalyzeRequest):
     www_report = await www_task
     custom404_report = await custom404_task
 
-    # sitemap from robots (optional)
     sitemap_from_robots: List[str] = []
     if robots_ok and robots_text:
         for line in robots_text.splitlines():
@@ -459,6 +568,7 @@ async def analyze(req: AnalyzeRequest):
                     sitemap_from_robots.append(v)
 
     tech = _detect_tech(fetched.html)
+    tech["wordpress"] = wp
 
     seo = {
         "title": html_analysis["title"],
