@@ -8,7 +8,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
-
+from datetime import datetime, timedelta
+from jose import jwt
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
@@ -16,9 +17,13 @@ from pydantic import BaseModel, Field
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi import Depends
+from fastapi.security import OAuth2PasswordBearer
 
 from screenshots import take_screenshots_base64
 
+from database.database import AuditDatabase
+DATABASE_URL = "postgresql+psycopg2://administrator:administrator@localhost:5432/verificasite"
 app = FastAPI(title="Site Analyzer", version="1.0.0")
 
 app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
@@ -31,6 +36,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+SECRET_KEY = "verificasiteAdmin"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def admin_required(user=Depends(get_current_user)):
+    if not user.get("admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
 
 LANGUAGE_CODE_TO_NAME = {
     "en": "Engleza",
@@ -61,7 +101,7 @@ LANGUAGE_CODE_TO_NAME = {
 
 class AnalyzeRequest(BaseModel):
     url: str = Field(..., description="URL in orice forma: domain, www.domain, http(s)://...")
-
+    device: int = Field(1, ge=1, le=2)
 
 class AnalyzeResponse(BaseModel):
     input_url: str
@@ -694,6 +734,8 @@ async def analyze(req: AnalyzeRequest):
     if not candidates:
         raise HTTPException(status_code=400, detail="Invalid URL input")
 
+    audit_db = AuditDatabase(DATABASE_URL)
+
     fetched = await _fetch_first_working(candidates)
     host = _hostname_from_url(fetched.final_url)
     ip = _resolve_ip(host)
@@ -793,6 +835,19 @@ async def analyze(req: AnalyzeRequest):
         }
     }
 
+    device = req.device
+
+    audit_result = audit_db.insert_audit(
+        ip=ip,
+        url=fetched.final_url,
+        html=fetched.html,
+        scor=100,
+        device=device
+    )
+
+    if audit_result["status"] != 200:
+        print(audit_result["message"])
+
     return AnalyzeResponse(
         input_url=req.url,
         normalized_candidates=candidates,
@@ -809,3 +864,45 @@ async def analyze(req: AnalyzeRequest):
         checks=checks,
         screenshots=screenshots_b64,
     )
+
+
+@app.post("/login", response_model=LoginResponse)
+async def login(req: LoginRequest):
+
+    db_instance = AuditDatabase(database_url=DATABASE_URL)
+
+    result = db_instance.authenticate(req.username, req.password)
+
+    if result["status"] != 200:
+        raise HTTPException(status_code=401, detail=result["message"])
+
+    token = create_access_token(
+        {
+            "sub": result["data"]["username"],
+            "admin": result["data"]["admin"],
+        }
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+@app.get("/admin-only")
+async def admin_endpoint(user=Depends(admin_required)):
+    return {"ok": True}
+
+
+@app.get("/admin/audits")
+async def get_all_audits(user=Depends(admin_required)):
+    """
+    Returneaza toate audit-urile din baza de date. Acces doar pentru admin.
+    """
+    audit_db = AuditDatabase(DATABASE_URL)
+    result = audit_db.get_audits()
+
+    if result["status"] != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch audits")
+
+    return {"audits": result["data"]}
