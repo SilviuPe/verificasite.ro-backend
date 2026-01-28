@@ -11,12 +11,17 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from screenshots import take_screenshots_base64
 
 app = FastAPI(title="Site Analyzer", version="1.0.0")
+
+app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +30,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+LANGUAGE_CODE_TO_NAME = {
+    "en": "Engleza",
+    "fr": "Franceza",
+    "ro": "Romana",
+    "de": "Germana",
+    "es": "Spaniola",
+    "it": "Italiana",
+    "pt": "Portugheza",
+    "nl": "Olandeza",
+    "sv": "Suedeza",
+    "da": "Daneza",
+    "fi": "Finlandeza",
+    "no": "Norvegiana",
+    "pl": "Poloneza",
+    "cs": "Ceha",
+    "sk": "Slovaca",
+    "hu": "Maghiara",
+    "bg": "Bulgara",
+    "el": "Greaca",
+    "tr": "Turca",
+    "ru": "Rusa",
+    "uk": "Ucraineana",
+    "zh": "Chineza",
+    "ja": "Japoneza",
+    "ko": "Coreeana",
+}
 
 class AnalyzeRequest(BaseModel):
     url: str = Field(..., description="URL in orice forma: domain, www.domain, http(s)://...")
@@ -47,6 +80,7 @@ class AnalyzeResponse(BaseModel):
     social: Dict[str, Any]
     tech: Dict[str, Any]
     checks: Dict[str, Any]
+    screenshots: Dict[str, str]
 
 
 def _clean_input(raw: str) -> str:
@@ -165,6 +199,143 @@ async def _fetch_first_working(candidates: List[str], timeout_s: float = 25.0) -
 
 def _text_len(s: str) -> int:
     return len((s or "").strip())
+
+
+
+def _detect_facebook_pixel(html: str) -> Dict[str, Any]:
+    html_lower = (html or "").lower()
+
+    signals = []
+
+    # 1. Script oficial Meta
+    if "connect.facebook.net" in html_lower:
+        signals.append("connect_facebook_net")
+
+    # 2. fbq init / track
+    if "fbq('init'" in html_lower or 'fbq("init"' in html_lower:
+        signals.append("fbq_init")
+
+    if "fbq('track'" in html_lower or 'fbq("track"' in html_lower:
+        signals.append("fbq_track")
+
+    # 3. Noscript image fallback
+    if "facebook.com/tr" in html_lower:
+        signals.append("facebook_tr_pixel")
+
+    is_present = len(signals) > 0
+
+    return {
+        "present": is_present,
+        "signals": signals,
+        "note": (
+            "Meta (Facebook) Pixel detected via standard implementation signals."
+            if is_present
+            else "No Meta (Facebook) Pixel signals detected in page HTML."
+        ),
+    }
+
+def _detect_language(html: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html or "", "lxml")
+
+    detected_code = None
+    source = None
+
+    # 1. <html lang="...">
+    html_tag = soup.find("html")
+    if html_tag and html_tag.get("lang"):
+        detected_code = str(html_tag.get("lang")).strip()
+        source = "html_lang_attribute"
+
+    # 2. OpenGraph og:locale
+    if not detected_code:
+        og_locale = soup.find("meta", attrs={"property": re.compile(r"^og:locale$", re.I)})
+        if og_locale and og_locale.get("content"):
+            detected_code = str(og_locale.get("content")).strip()
+            source = "opengraph_locale"
+
+    # 3. Meta Content-Language
+    if not detected_code:
+        meta_lang = soup.find(
+            "meta",
+            attrs={"http-equiv": re.compile(r"^content-language$", re.I)},
+        )
+        if meta_lang and meta_lang.get("content"):
+            detected_code = str(meta_lang.get("content")).strip()
+            source = "meta_content_language"
+
+    if not detected_code:
+        return {
+            "detected": False,
+            "language": None,
+            "language_code": None,
+            "source": None,
+            "note": "No explicit language declaration found.",
+        }
+
+    # normalizare BCP 47: en-US -> en
+    primary_code = detected_code.split("-")[0].lower()
+
+    language_name = LANGUAGE_CODE_TO_NAME.get(primary_code)
+
+    return {
+        "detected": True,
+        "language": language_name,          # ex: "Engleza"
+        "language_code": detected_code.lower(),  # ex: "en-us"
+        "source": source,
+        "note": (
+            None
+            if language_name
+            else "Language code detected, but no human-readable mapping is defined."
+        ),
+    }
+
+
+def _extract_social_links(base_url: str, html: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html or "", "lxml")
+
+    social_domains = {
+        "facebook": ["facebook.com", "fb.com"],
+        "instagram": ["instagram.com"],
+    }
+
+    found: Dict[str, List[str]] = {
+        "facebook": [],
+        "instagram": [],
+    }
+
+    for a in soup.find_all("a"):
+        href = a.get("href")
+        if not href:
+            continue
+
+        href = str(href).strip()
+        if href.startswith("#"):
+            continue
+
+        full_url = urljoin(base_url, href)
+        parsed = urlparse(full_url)
+        host = (parsed.hostname or "").lower()
+
+        for platform, domains in social_domains.items():
+            for d in domains:
+                if host.endswith(d):
+                    found[platform].append(full_url)
+
+    # dedup si limiteaza
+    for k in found:
+        found[k] = list(dict.fromkeys(found[k]))[:10]
+
+    return {
+        "facebook": {
+            "present": len(found["facebook"]) > 0,
+            "links": found["facebook"],
+        },
+        "instagram": {
+            "present": len(found["instagram"]) > 0,
+            "links": found["instagram"],
+        },
+        "note": "Links are extracted only from explicit anchor tags. No inference is performed.",
+    }
 
 
 def _analyze_html(base_url: str, html: str) -> Dict[str, Any]:
@@ -526,13 +697,15 @@ async def analyze(req: AnalyzeRequest):
     fetched = await _fetch_first_working(candidates)
     host = _hostname_from_url(fetched.final_url)
     ip = _resolve_ip(host)
+    screenshots_b64 = await take_screenshots_base64(fetched.final_url)
 
     ssl_ok = urlparse(fetched.final_url).scheme == "https"
 
     html_analysis = _analyze_html(fetched.final_url, fetched.html)
-
+    social_links = _extract_social_links(fetched.final_url, fetched.html)
+    language = _detect_language(fetched.html)
     wp = _detect_wordpress_from_html(fetched.html, fetched.headers)
-
+    facebook_pixel = _detect_facebook_pixel(fetched.html)
     # optional: daca e wordpress dar versiunea lipseste, incearca feed
     if wp["is_wordpress"] and not wp["version"]:
         feed_v = await _try_wp_version_from_feed(fetched.final_url)
@@ -569,6 +742,7 @@ async def analyze(req: AnalyzeRequest):
 
     tech = _detect_tech(fetched.html)
     tech["wordpress"] = wp
+    tech["facebook_pixel"] = facebook_pixel
 
     seo = {
         "title": html_analysis["title"],
@@ -606,6 +780,8 @@ async def analyze(req: AnalyzeRequest):
 
     social = {
         "opengraph": html_analysis["opengraph"],
+        "profiles": social_links,
+        "language": language,
     }
 
     checks = {
@@ -631,4 +807,5 @@ async def analyze(req: AnalyzeRequest):
         social=social,
         tech=tech,
         checks=checks,
+        screenshots=screenshots_b64,
     )
