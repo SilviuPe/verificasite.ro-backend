@@ -5,20 +5,31 @@ import json
 import re
 import socket
 import uuid
+import io
+import httpx
+
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 from datetime import datetime, timedelta
+from openpyxl import Workbook
 from jose import jwt
-import httpx
+
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi import Depends
+from fastapi import Depends, Query
 from fastapi.security import OAuth2PasswordBearer
+from fastapi.responses import StreamingResponse
+
+
 
 from screenshots import take_screenshots_base64
 
@@ -902,7 +913,164 @@ async def get_all_audits(user=Depends(admin_required)):
     audit_db = AuditDatabase(DATABASE_URL)
     result = audit_db.get_audits()
 
+    returned_result = []
+    for audit in result["data"]:
+        new_audit_entity = audit
+        new_audit_entity["html"] = audit["html"][:100]
+        returned_result.append(new_audit_entity)
+
     if result["status"] != 200:
         raise HTTPException(status_code=500, detail="Failed to fetch audits")
 
-    return {"audits": result["data"]}
+    return {"audits": returned_result}
+
+
+@app.post("/admin/export_xlsx")
+async def get_export_xlsx_by_ids(
+    ids: List[int] = Query(...),  # lista de ID-uri
+    user=Depends(admin_required)
+):
+    audit_db = AuditDatabase(DATABASE_URL)
+
+    # Preluam audit-urile filtrate doar dupa ID-uri
+    all_audits = []
+    for audit_id in ids:
+        result = audit_db.get_audits(id=audit_id)
+        if result.get("status") == 200:
+            all_audits.extend(result["data"])
+
+    if not all_audits:
+        return {"status": 404, "message": "No audits found for provided IDs"}
+
+    # Cream fisierul XLSX
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Audits"
+
+    # Header
+    headers = ["ID", "IP", "URL", "HTML", "Scor", "Device", "Date"]
+    ws.append(headers)
+
+    # Continut
+    for a in all_audits:
+        ws.append([
+            a["id"],
+            a["ip"],
+            a["url"],
+            a["html"],
+            a["scor"],
+            "Desktop" if a["device"] == 1 else "Mobile",
+            a["date"]
+        ])
+
+    # Scriem XLSX intr-un buffer
+    file_stream = io.BytesIO()
+    wb.save(file_stream)
+    file_stream.seek(0)
+
+    filename = f"audits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    # Returnam ca download
+    return StreamingResponse(
+        file_stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+@app.post("/admin/export_pdf")
+async def get_export_pdf(
+    ids: List[int] = Query(...),
+    user=Depends(admin_required)
+):
+    audit_db = AuditDatabase(DATABASE_URL)
+
+    all_audits = []
+    for audit_id in ids:
+        result = audit_db.get_audits(id=audit_id)
+        if result.get("status") == 200:
+            all_audits.extend(result["data"])
+
+    if not all_audits:
+        return {"status": 404, "message": "No audits found for provided IDs"}
+
+    # Setari PDF
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    # Margin
+    margin_left = 20 * mm
+    margin_top = height - 20 * mm
+    line_height = 8 * mm
+    max_rows_per_page = int((height - 40*mm) / line_height)  # 20mm top + 20mm bottom
+
+    # Functie pentru desenarea headerului
+    def draw_header(page_num: int):
+        c.setFont("Helvetica-Bold", 12)
+        header_text = "Audits Export - Page %d" % page_num
+        c.drawString(margin_left, height - 15*mm, header_text)
+        c.setFont("Helvetica-Bold", 10)
+        columns = ["ID", "IP", "URL", "Scor", "Device", "Data"]
+        x = margin_left
+        c.drawString(x, height - 25*mm, columns[0][:20])  # limitam lungimea textului
+        x += 10 * mm
+        for col in columns[1:]:
+            if col == 'URL':
+                c.drawString(x, height - 25 * mm, col)
+                x += 45 * mm
+                continue
+
+            c.drawString(x, height - 25*mm, col)
+            x += 25*mm  # ajustati dupa nevoie
+
+    # Desenam randurile
+    y = margin_top
+    row_count = 0
+    page_num = 1
+    draw_header(page_num)
+    y -= 10*mm
+
+    for audit in all_audits:
+        if row_count >= max_rows_per_page:
+            c.showPage()
+            page_num += 1
+            draw_header(page_num)
+            y = margin_top - 10*mm
+            row_count = 0
+
+        c.setFont("Helvetica", 9)
+        x = margin_left
+        values = [
+            str(audit["id"]),
+            audit["ip"],
+            audit["url"],
+            str(audit["scor"]),
+            "Desktop" if audit["device"] == 1 else "Mobile",
+            audit["date"]
+        ]
+
+        c.drawString(x, y, values[0][:20])  # limitam lungimea textului
+        x += 10 * mm
+
+        for val in values[1:]:
+            if values.index(val) == 2:
+                c.drawString(x, y, val[:30])  # limitam lungimea textului
+                x += 45*mm
+                continue
+
+            c.drawString(x, y, val[:20])  # limitam lungimea textului
+            x += 25*mm
+        y -= line_height
+        row_count += 1
+
+    c.save()
+    buffer.seek(0)
+
+    filename = f"audits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
