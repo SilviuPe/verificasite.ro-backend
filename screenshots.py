@@ -1,21 +1,26 @@
-from pyppeteer import launch
 import base64
+from playwright.async_api import async_playwright
 
-async def take_screenshot_base64(url: str, width=1366, height=768) -> str:
-    browser = await launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-        ],
-    )
+async def take_screenshots_base64(url: str) -> dict:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
 
-    page = await browser.newPage()
-    await page.setViewport({"width": width, "height": height})
-    await page.goto(url, {"waitUntil": "networkidle2", "timeout": 30000})
+        # desktop
+        page = await browser.new_page(
+            viewport={"width": 1366, "height": 768}
+        )
+        await page.goto(url, wait_until="networkidle")
+        desktop_bytes = await page.screenshot(full_page=False)
 
-    screenshot_bytes = await page.screenshot({"fullPage": True})
-    await browser.close()
+        # mobile
+        iphone = p.devices["iPhone 12"]
+        mobile_page = await browser.new_page(**iphone)
+        await mobile_page.goto(url, wait_until="networkidle")
+        mobile_bytes = await mobile_page.screenshot(full_page=False)
 
-    return base64.b64encode(screenshot_bytes).decode("utf-8")
+        await browser.close()
+
+    return {
+        "desktop": base64.b64encode(desktop_bytes).decode("ascii"),
+        "mobile": base64.b64encode(mobile_bytes).decode("ascii"),
+    }

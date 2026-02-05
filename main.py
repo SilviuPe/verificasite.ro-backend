@@ -32,16 +32,17 @@ from fastapi.responses import StreamingResponse
 
 
 from screenshots import take_screenshots_base64
-
+from utils import _get_ssl_info
 from database.database import AuditDatabase
-DATABASE_URL = "postgresql+psycopg2://administrator:administrator@localhost:5432/verificasite"
+
+DATABASE_URL = "postgresql+psycopg2://verificasite:verificasite_admin@localhost:5432/verificasite_db"
 app = FastAPI(title="Site Analyzer", version="1.0.0")
 
 app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:4173"],
+    allow_origins=["http://localhost:5173", "http://localhost:4173", "http://51.38.65.188"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -122,9 +123,6 @@ class AnalyzeResponse(BaseModel):
     redirect_chain: List[str]
     status_code: int
     ip_address: Optional[str]
-
-    # True daca final_url e https si requestul a reusit cu verify TLS
-    ssl_ok: bool
 
     seo: Dict[str, Any]
     structured_data: Dict[str, Any]
@@ -251,6 +249,42 @@ async def _fetch_first_working(candidates: List[str], timeout_s: float = 25.0) -
 def _text_len(s: str) -> int:
     return len((s or "").strip())
 
+def _detect_google_ads(html: str) -> Dict[str, Any]:
+    html_lower = (html or "").lower()
+
+    aw_ids = set()
+    conversion_ids = set()
+    signals = []
+
+    # 1. Scripturi Google Ads
+    if "googleadservices.com" in html_lower:
+        signals.append("googleadservices_script")
+
+    # 2. gtag cu AW
+    for m in re.findall(r"aw-\d{6,}", html_lower, re.I):
+        aw_ids.add(m.upper())
+        signals.append("gtag_aw_config")
+
+    # 3. Conversii Google Ads
+    # send_to: "AW-XXXX/YYYY"
+    for m in re.findall(r'aw-\d+/\w+', html_lower, re.I):
+        conversion_ids.add(m.upper())
+        signals.append("conversion_event")
+
+    is_present = len(aw_ids) > 0 or len(conversion_ids) > 0 or len(signals) > 0
+
+    return {
+        "present": is_present,
+        "aw_ids": sorted(list(aw_ids)),
+        "conversion_ids": sorted(list(conversion_ids)),
+        "signals": list(dict.fromkeys(signals)),
+        "note": (
+            "Google Ads tracking detected via public page code (AW IDs / conversion tags). "
+            "Account ownership, budgets and campaigns cannot be determined."
+            if is_present
+            else "No Google Ads tracking signals detected in page HTML."
+        ),
+    }
 
 
 def _detect_facebook_pixel(html: str) -> Dict[str, Any]:
@@ -340,6 +374,24 @@ def _detect_language(html: str) -> Dict[str, Any]:
         ),
     }
 
+def _detect_google_maps(html: str) -> bool:
+    s = (html or "").lower()
+
+    signals = [
+        "google.com/maps",
+        "maps.google.com",
+        "goo.gl/maps",
+        "maps/embed",
+        "pb=!1m",           # pattern tipic embed
+        "googleapis.com/maps",
+    ]
+
+    for sig in signals:
+        if sig in s:
+            return True
+
+    return False
+
 
 def _extract_social_links(base_url: str, html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html or "", "lxml")
@@ -372,7 +424,6 @@ def _extract_social_links(base_url: str, html: str) -> Dict[str, Any]:
                 if host.endswith(d):
                     found[platform].append(full_url)
 
-    # dedup si limiteaza
     for k in found:
         found[k] = list(dict.fromkeys(found[k]))[:10]
 
@@ -605,16 +656,92 @@ async def _www_resolve_report(final_url: str) -> Dict[str, Any]:
 def _detect_tech(html: str) -> Dict[str, Any]:
     s = (html or "").lower()
 
-    ga = ("www.googletagmanager.com/gtag/js" in s) or ("google-analytics.com" in s) or ("gtag(" in s)
-    gtm = ("googletagmanager.com/gtm.js" in s) or ("gtm-" in s)
-    jquery = ("jquery" in s)
+    def has(*patterns):
+        return any(p in s for p in patterns)
 
-    return {
-        "google_analytics_detected": bool(ga),
-        "google_tag_manager_detected": bool(gtm),
-        "jquery_detected": bool(jquery),
-        "note": "Heuristic detection based on page HTML. False positives/negatives are possible.",
+    tech = {
+        # Google ecosystem
+        "google_analytics": has(
+            "www.googletagmanager.com/gtag/js",
+            "google-analytics.com/analytics.js",
+            "gtag(",
+            "ga(",
+        ),
+
+        "google_tag_manager": has(
+            "googletagmanager.com/gtm.js",
+            "gtm.start",
+            "gtm-",
+        ),
+
+        "google_fonts": has(
+            "fonts.googleapis.com",
+            "fonts.gstatic.com",
+            "googleapis.com/css2",
+        ),
+
+        "google_maps": has(
+            "google.com/maps",
+            "maps.google.com",
+            "goo.gl/maps",
+            "maps/embed",
+            "pb=!1m",
+            "googleapis.com/maps",
+        ),
+
+        # Marketing and tracking
+        "facebook_pixel": has(
+            "connect.facebook.net",
+            "fbq(",
+            "facebook.com/tr",
+        ),
+
+        "hotjar": has(
+            "static.hotjar.com",
+            "hotjar-",
+            "hjSettings",
+        ),
+
+        # Infrastructure
+        "cloudflare": has(
+            "cloudflare.com",
+            "cf-ray",
+            "__cf_chl",
+        ),
+
+        # UX and media
+        "recaptcha": has(
+            "google.com/recaptcha",
+            "g-recaptcha",
+        ),
+
+        "youtube_embed": has(
+            "youtube.com/embed",
+            "youtu.be",
+        ),
+
+        # Libraries
+        "jquery": has(
+            "jquery",
+            "jquery.min.js",
+        ),
+
+        # Cookie consent
+        "cookie_consent": has(
+            "cookieconsent",
+            "onetrust",
+            "cookielaw",
+            "iubenda",
+            "termly",
+        ),
     }
+
+    tech["note"] = (
+        "Detection is based strictly on HTML signals and known script patterns. "
+        "Results represent presence indicators, not configuration correctness."
+    )
+
+    return tech
 
 
 async def _custom_404_check(final_url: str) -> Dict[str, Any]:
@@ -751,14 +878,14 @@ async def analyze(req: AnalyzeRequest):
     host = _hostname_from_url(fetched.final_url)
     ip = _resolve_ip(host)
     screenshots_b64 = await take_screenshots_base64(fetched.final_url)
-
-    ssl_ok = urlparse(fetched.final_url).scheme == "https"
+    ssl_info = _get_ssl_info(fetched.final_url)
 
     html_analysis = _analyze_html(fetched.final_url, fetched.html)
     social_links = _extract_social_links(fetched.final_url, fetched.html)
     language = _detect_language(fetched.html)
     wp = _detect_wordpress_from_html(fetched.html, fetched.headers)
     facebook_pixel = _detect_facebook_pixel(fetched.html)
+    google_ads = _detect_google_ads(fetched.html)
     # optional: daca e wordpress dar versiunea lipseste, incearca feed
     if wp["is_wordpress"] and not wp["version"]:
         feed_v = await _try_wp_version_from_feed(fetched.final_url)
@@ -796,7 +923,8 @@ async def analyze(req: AnalyzeRequest):
     tech = _detect_tech(fetched.html)
     tech["wordpress"] = wp
     tech["facebook_pixel"] = facebook_pixel
-
+    tech["google_ads"] = google_ads
+    tech["google_maps"] = _detect_google_maps(fetched.html)
     seo = {
         "title": html_analysis["title"],
         "meta_description": html_analysis["meta_description"],
@@ -843,9 +971,9 @@ async def analyze(req: AnalyzeRequest):
             "final_url": fetched.final_url,
             "status_code": fetched.status_code,
             "redirect_chain": fetched.redirect_chain,
-        }
+        },
+        "ssl_certificate": ssl_info,
     }
-
     device = req.device
 
     audit_result = audit_db.insert_audit(
@@ -867,7 +995,6 @@ async def analyze(req: AnalyzeRequest):
         redirect_chain=fetched.redirect_chain,
         status_code=fetched.status_code,
         ip_address=ip,
-        ssl_ok=ssl_ok,
         seo=seo,
         structured_data=structured_data,
         social=social,
@@ -883,7 +1010,7 @@ async def login(req: LoginRequest):
     db_instance = AuditDatabase(database_url=DATABASE_URL)
 
     result = db_instance.authenticate(req.username, req.password)
-
+    print(result["message"])
     if result["status"] != 200:
         raise HTTPException(status_code=401, detail=result["message"])
 
@@ -905,7 +1032,7 @@ async def admin_endpoint(user=Depends(admin_required)):
     return {"ok": True}
 
 
-@app.get("/admin/audits")
+@app.get("/allaudits")
 async def get_all_audits(user=Depends(admin_required)):
     """
     Returneaza toate audit-urile din baza de date. Acces doar pentru admin.
@@ -925,7 +1052,7 @@ async def get_all_audits(user=Depends(admin_required)):
     return {"audits": returned_result}
 
 
-@app.post("/admin/export_xlsx")
+@app.post("/export_xlsx")
 async def get_export_xlsx_by_ids(
     ids: List[int] = Query(...),  # lista de ID-uri
     user=Depends(admin_required)
@@ -978,7 +1105,7 @@ async def get_export_xlsx_by_ids(
     )
 
 
-@app.post("/admin/export_pdf")
+@app.post("/export_pdf")
 async def get_export_pdf(
     ids: List[int] = Query(...),
     user=Depends(admin_required)
