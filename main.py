@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+import csv
+import packaging.version as pv
 import asyncio
 import json
 import re
@@ -7,7 +8,8 @@ import socket
 import uuid
 import io
 import httpx
-
+import base64
+from pathlib import Path
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -21,7 +23,6 @@ from jose import jwt
 
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -34,8 +35,11 @@ from fastapi.responses import StreamingResponse
 from screenshots import take_screenshots_base64
 from utils import _get_ssl_info
 from database.database import AuditDatabase
+from plugins import analyze_wp_plugins
+from models import AnalyzeRequest, AnalyzeResponse, LoginRequest, LoginResponse
 
-DATABASE_URL = "postgresql+psycopg2://verificasite:verificasite_admin@localhost:5432/verificasite_db"
+from constants import LANGUAGE_CODE_TO_NAME, DATABASE_URL, SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+
 app = FastAPI(title="Site Analyzer", version="1.0.0")
 
 app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
@@ -48,19 +52,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-SECRET_KEY = "verificasiteAdmin"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -83,53 +74,6 @@ def admin_required(user=Depends(get_current_user)):
     if not user.get("admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
-
-LANGUAGE_CODE_TO_NAME = {
-    "en": "Engleza",
-    "fr": "Franceza",
-    "ro": "Romana",
-    "de": "Germana",
-    "es": "Spaniola",
-    "it": "Italiana",
-    "pt": "Portugheza",
-    "nl": "Olandeza",
-    "sv": "Suedeza",
-    "da": "Daneza",
-    "fi": "Finlandeza",
-    "no": "Norvegiana",
-    "pl": "Poloneza",
-    "cs": "Ceha",
-    "sk": "Slovaca",
-    "hu": "Maghiara",
-    "bg": "Bulgara",
-    "el": "Greaca",
-    "tr": "Turca",
-    "ru": "Rusa",
-    "uk": "Ucraineana",
-    "zh": "Chineza",
-    "ja": "Japoneza",
-    "ko": "Coreeana",
-}
-
-class AnalyzeRequest(BaseModel):
-    url: str = Field(..., description="URL in orice forma: domain, www.domain, http(s)://...")
-    device: int = Field(1, ge=1, le=2)
-
-class AnalyzeResponse(BaseModel):
-    input_url: str
-    normalized_candidates: List[str]
-    fetched_url: str
-    final_url: str
-    redirect_chain: List[str]
-    status_code: int
-    ip_address: Optional[str]
-
-    seo: Dict[str, Any]
-    structured_data: Dict[str, Any]
-    social: Dict[str, Any]
-    tech: Dict[str, Any]
-    checks: Dict[str, Any]
-    screenshots: Dict[str, str]
 
 
 def _clean_input(raw: str) -> str:
@@ -866,6 +810,179 @@ async def _try_wp_version_from_feed(final_url: str) -> Optional[str]:
                 continue
     return None
 
+
+def load_vulnerabilities_from_csv() -> Dict[str, List[Dict[str, Any]]]:
+    """Încarcă vulnerabilitățile din CSV și le grupează după software_slug"""
+    csv_path = Path(__file__).parent / "vulnerabilities.csv"
+    vulnerabilities_by_slug: Dict[str, List[Dict[str, Any]]] = {}
+
+    if not csv_path.exists():
+        print(f"Warning: vulnerabilities.csv not found at {csv_path}")
+        return vulnerabilities_by_slug
+
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                slug = row.get("software_slug", "")
+                if not slug:
+                    continue
+
+                vuln = {
+                    "id": row.get("id"),
+                    "title": row.get("title"),
+                    "cve_id": row.get("cve_id"),
+                    "cvss_score": row.get("cvss_score"),
+                    "cvss_rating": row.get("cvss_rating"),
+                    "description": row.get("description"),
+                    "affected_versions": row.get("affected_versions"),
+                    "remediation": row.get("remediation"),
+                }
+
+                if slug not in vulnerabilities_by_slug:
+                    vulnerabilities_by_slug[slug] = []
+                vulnerabilities_by_slug[slug].append(vuln)
+
+        print(
+            f"Loaded {sum(len(v) for v in vulnerabilities_by_slug.values())} vulnerabilities for {len(vulnerabilities_by_slug)} plugins/themes")
+    except Exception as e:
+        print(f"Error loading vulnerabilities: {e}")
+
+    return vulnerabilities_by_slug
+
+
+def check_version_affected(current_version: str, affected_versions: str) -> bool:
+    """Verifică dacă versiunea curentă este afectată (ex: <= 3.3.1)"""
+    if not current_version or not affected_versions:
+        return False
+
+    try:
+        curr = pv.parse(current_version)
+    except Exception:
+        return False
+
+    # Parsează "<= 3.3.1"
+    affected_versions = affected_versions.strip()
+    if affected_versions.startswith("<="):
+        try:
+            threshold = pv.parse(affected_versions[2:].strip())
+            return curr <= threshold
+        except Exception:
+            return False
+
+    # Dacă e interval gen "1.0 - 2.0"
+    if " - " in affected_versions:
+        parts = affected_versions.split(" - ")
+        if len(parts) == 2:
+            try:
+                low = pv.parse(parts[0].strip())
+                high = pv.parse(parts[1].strip())
+                return low <= curr <= high
+            except Exception:
+                return False
+
+    return False
+
+
+async def _get_favicon_base64(final_url: str, html_analysis: Dict[str, Any]) -> Optional[str]:
+
+    declared_icons = html_analysis.get("favicon", {}).get("declared_icons", [])
+
+    # Lista de URL-uri de încercat
+    urls_to_try = []
+
+    # 1. Adăugăm iconițele declarate în HTML
+    urls_to_try.extend(declared_icons)
+
+    # 2. Adăugăm /favicon.ice ca fallback
+    parsed = urlparse(final_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    urls_to_try.append(urljoin(base_url, "/favicon.ico"))
+
+    async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SiteAnalyzer/1.0; +https://example.local)"},
+    ) as client:
+        for url in urls_to_try:
+            try:
+                r = await client.get(url)
+                if r.status_code == 200 and r.content:
+                    # Verificăm dacă e o imagine validă
+                    content_type = r.headers.get("content-type", "").lower()
+                    if "image" in content_type:
+                        # Convertim la base64
+                        b64 = base64.b64encode(r.content).decode("utf-8")
+                        # Adăugăm prefixul data URL
+                        return f"data:{content_type.split(';')[0]};base64,{b64}"
+            except Exception:
+                continue
+
+    return None
+
+
+def get_vulnerabilities_for_plugin(plugin_slug: str, plugin_version: str,
+                                   vulnerabilities_db: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Returnează vulnerabilitățile pentru un plugin, dacă versiunea e afectată"""
+    if plugin_slug not in vulnerabilities_db:
+        return []
+
+    affected_vulns = []
+    for vuln in vulnerabilities_db[plugin_slug]:
+        affected_versions = vuln.get("affected_versions", "")
+        if check_version_affected(plugin_version, affected_versions):
+            affected_vulns.append(vuln)
+
+    return affected_vulns
+
+
+async def detect_vulnerabilities(plugins_info: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Detectează vulnerabilități pentru plugin-urile găsite"""
+    vulnerabilities_db = load_vulnerabilities_from_csv()
+
+    results = {
+        "plugins_with_vulns": [],
+        "total_critical": 0,
+        "total_high": 0,
+        "total_medium": 0,
+        "total_low": 0,
+    }
+
+    for plugin in plugins_info:
+        slug = plugin.get("name")
+        version = plugin.get("current_version")
+
+        if not slug or not version:
+            continue
+
+        vulns = get_vulnerabilities_for_plugin(slug, version, vulnerabilities_db)
+
+        if vulns:
+            critical = sum(1 for v in vulns if v.get("cvss_rating") == "Critical")
+            high = sum(1 for v in vulns if v.get("cvss_rating") == "High")
+            medium = sum(1 for v in vulns if v.get("cvss_rating") == "Medium")
+            low = sum(1 for v in vulns if v.get("cvss_rating") == "Low")
+
+            results["plugins_with_vulns"].append({
+                "name": plugin.get("name", slug),
+                "slug": slug,
+                "version": version,
+                "vulnerabilities": vulns,
+                "critical_count": critical,
+                "high_count": high,
+                "medium_count": medium,
+                "low_count": low,
+            })
+
+            results["total_critical"] += critical
+            results["total_high"] += high
+            results["total_medium"] += medium
+            results["total_low"] += low
+
+    return results
+
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
     candidates = _build_url_candidates(req.url)
@@ -881,6 +998,7 @@ async def analyze(req: AnalyzeRequest):
     ssl_info = _get_ssl_info(fetched.final_url)
 
     html_analysis = _analyze_html(fetched.final_url, fetched.html)
+    favicon_base64 = await _get_favicon_base64(fetched.final_url, html_analysis)
     social_links = _extract_social_links(fetched.final_url, fetched.html)
     language = _detect_language(fetched.html)
     wp = _detect_wordpress_from_html(fetched.html, fetched.headers)
@@ -911,6 +1029,10 @@ async def analyze(req: AnalyzeRequest):
     sitemap_ok, sitemap_text, sitemap_status = await sitemap_task
     www_report = await www_task
     custom404_report = await custom404_task
+
+    plugins_audit = await analyze_wp_plugins(fetched.html)
+
+    vulns_result = await detect_vulnerabilities(plugins_audit.get("plugins", []))
 
     sitemap_from_robots: List[str] = []
     if robots_ok and robots_text:
@@ -1001,6 +1123,9 @@ async def analyze(req: AnalyzeRequest):
         tech=tech,
         checks=checks,
         screenshots=screenshots_b64,
+        plugins=plugins_audit,
+        vulnerabilities=vulns_result,
+        favicon = favicon_base64
     )
 
 
@@ -1200,4 +1325,13 @@ async def get_export_pdf(
         buffer,
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+import uvicorn
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        log_level="info"
     )
