@@ -490,51 +490,63 @@ def _analyze_html(base_url: str, html: str) -> Dict[str, Any]:
         },
     }
 
+def _is_internal_link(base_url: str, url: str) -> bool:
+    try:
+        base_host = urlparse(base_url).hostname
+        url_host = urlparse(url).hostname
 
-async def _check_links(links: List[str], limit: int = 60) -> Dict[str, Any]:
-    """
-    Verifica linkurile cu HEAD (fallback GET). Limitam la primele N ca sa nu explodeze timpul.
-    """
-    links = links[:limit]
+        if not url_host:
+            return False
+
+        return base_host == url_host
+    except Exception:
+        return False
+
+async def _check_links(links: List[str], base_url: str, limit: int = 60) -> Dict[str, Any]:
+    internal_links = [
+        u for u in links
+        if _is_internal_link(base_url, u)
+    ]
+
+    internal_links = internal_links[:limit]
+
     sem = asyncio.Semaphore(12)
 
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(15.0),
-        headers={"User-Agent": "Mozilla/5.0 (compatible; SiteAnalyzer/1.0; +https://example.local)"},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; SiteAnalyzer/1.0)"},
     ) as client:
 
-        async def check_one(u: str) -> Tuple[str, Optional[int], Optional[str]]:
+        async def check_one(u: str):
             async with sem:
                 try:
-                    # Unele servere nu suporta HEAD corect
-                    try:
-                        r = await client.head(u)
-                        return (u, int(r.status_code), None)
-                    except httpx.HTTPError:
-                        r = await client.get(u)
-                        return (u, int(r.status_code), None)
+                    r = await client.get(u)
+                    return {
+                        "url": u,
+                        "status_code": r.status_code,
+                        "broken": r.status_code >= 400
+                    }
                 except Exception as e:
-                    return (u, None, str(e))
+                    return {
+                        "url": u,
+                        "status_code": None,
+                        "broken": True,
+                        "error": str(e)
+                    }
 
-        results = await asyncio.gather(*(check_one(u) for u in links))
+        results = await asyncio.gather(*(check_one(u) for u in internal_links))
 
-    broken = []
-    ok = 0
-    for u, code, err in results:
-        if err is not None or code is None or code >= 400:
-            broken.append({"url": u, "status_code": code, "error": err})
-        else:
-            ok += 1
+    broken = [r for r in results if r["broken"]]
+    ok = [r for r in results if not r["broken"]]
 
     return {
         "checked": len(results),
-        "ok": ok,
+        "ok": len(ok),
         "broken": len(broken),
-        "broken_samples": broken[:25],
-        "note": f"Checked first {len(results)} links (cap {limit}).",
+        "broken_pages": broken[:25],
+        "note": "Only internal pages were checked (same domain). External links are ignored."
     }
-
 
 async def _fetch_text(url: str) -> Tuple[bool, Optional[str], Optional[int]]:
     async with httpx.AsyncClient(
@@ -1016,7 +1028,9 @@ async def analyze(req: AnalyzeRequest):
 
     links_sample = html_analysis["links"]["extracted_sample"]
 
-    links_task = asyncio.create_task(_check_links(links_sample, limit=60))
+    links_task = asyncio.create_task(
+        _check_links(links_sample, fetched.final_url, limit=60)
+    )
 
     robots_url = urljoin(fetched.final_url, "/robots.txt")
     sitemap_url = urljoin(fetched.final_url, "/sitemap.xml")
