@@ -6,10 +6,12 @@ import json
 import re
 import socket
 import uuid
+import uvicorn
 import io
 import httpx
 import base64
 from pathlib import Path
+from datetime import date
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -36,8 +38,8 @@ from screenshots import take_screenshots_base64
 from utils import _get_ssl_info
 from database.database import AuditDatabase
 from plugins import analyze_wp_plugins
-from models import AnalyzeRequest, AnalyzeResponse, LoginRequest, LoginResponse
-
+from models import AnalyzeRequest, AnalyzeResponse, LoginRequest, LoginResponse, CreateLeadRequest
+from scoring import calculate_general_score
 from constants import LANGUAGE_CODE_TO_NAME, DATABASE_URL, SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
 
 app = FastAPI(title="Site Analyzer", version="1.0.0")
@@ -1109,6 +1111,12 @@ async def analyze(req: AnalyzeRequest):
     if audit_result["status"] != 200:
         print(audit_result["message"])
 
+    score = calculate_general_score({
+        "seo": seo,
+        "tech": tech,
+        "checks": checks,
+    })
+
     return AnalyzeResponse(
         input_url=req.url,
         normalized_candidates=candidates,
@@ -1125,7 +1133,8 @@ async def analyze(req: AnalyzeRequest):
         screenshots=screenshots_b64,
         plugins=plugins_audit,
         vulnerabilities=vulns_result,
-        favicon = favicon_base64
+        favicon = favicon_base64,
+        score=score
     )
 
 
@@ -1327,7 +1336,21 @@ async def get_export_pdf(
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-import uvicorn
+@app.post("/leads")
+async def create_lead(req: CreateLeadRequest):
+    audit_db = AuditDatabase(DATABASE_URL)
+
+    result = audit_db.insert_lead(
+        website=req.website,
+        date=date.today(),
+        company_name=req.company_name
+    )
+
+    if result["status"] != 200:
+        raise HTTPException(status_code=500, detail=result["message"])
+
+    return result
+
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",

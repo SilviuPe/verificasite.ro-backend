@@ -5,7 +5,8 @@ from sqlalchemy import (
     Text,
     TIMESTAMP,
     CheckConstraint,
-    Boolean
+    Boolean,
+    Date
 )
 
 from datetime import datetime
@@ -33,3 +34,13 @@ class User(Base):
     username = Column(String(150), unique=True, nullable=False)
     password = Column(String, nullable=False)
     admin = Column(Boolean, nullable=False, default=False)
+
+
+
+class Lead(Base):
+    __tablename__ = "leads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    website = Column(Text)
+    date = Column(Date)
+    company_name = Column(Text)

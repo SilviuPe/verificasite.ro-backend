@@ -8,7 +8,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import IntegrityError
 
-from .models import Audit, User
+from .models import Audit, User, Lead
 from .utils import hash_password,verify_password
 
 class AuditDatabase:
@@ -140,6 +140,36 @@ class AuditDatabase:
             }
 
         except Exception:
+            return {
+                "status": 500,
+                "message": "Server error",
+            }
+
+    def insert_lead(
+            self,
+            website: str,
+            date,
+            company_name: str,
+    ):
+        try:
+            with self.Session() as session:
+                lead = Lead(
+                    website=website,
+                    date=date,
+                    company_name=company_name,
+                )
+                session.add(lead)
+                session.commit()
+                session.refresh(lead)
+
+                return {
+                    "status": 200,
+                    "message": "Lead inserted successfully",
+                    "data": {"id": lead.id},
+                }
+
+        except Exception as error:
+            print(error)
             return {
                 "status": 500,
                 "message": "Server error",

@@ -25,7 +25,7 @@ LANGUAGE_CODE_TO_NAME = {
     "ko": "Coreeana",
 }
 
-DATABASE_URL = "postgresql+psycopg2://verificasite:verificasite_admin@localhost:5432/verificasite_db"
+DATABASE_URL = "postgresql+psycopg2://administrator:administrator@localhost:5432/verificasite"
 SECRET_KEY = "verificasiteAdmin"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60

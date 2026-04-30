@@ -1,6 +1,10 @@
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
+from datetime import date
 
+class CreateLeadRequest(BaseModel):
+    website: str
+    company_name: str
 
 class AnalyzeRequest(BaseModel):
     url: str = Field(..., description="URL in orice forma: domain, www.domain, http(s)://...")
@@ -25,6 +29,7 @@ class AnalyzeResponse(BaseModel):
 
     vulnerabilities: Dict[str, Any] = {}
     favicon: Optional[str] = None
+    score: Dict[str, Any]
 
 
 
